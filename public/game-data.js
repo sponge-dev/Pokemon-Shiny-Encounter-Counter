@@ -186,4 +186,12 @@ window.__ENCOUNTER_UI = {
     { id: "lets-go-combo", label: "Let's Go catch combo — improves with chain" },
     { id: "custom", label: "Custom (describe in notes)" },
   ],
+
+  /**
+   * Catch button sound: played from this URL first (MP3/OGG/WAV in `public/` is fine).
+   * Browsers cannot use a YouTube watch URL as audio — export the clip for personal use (e.g. from
+   * https://www.youtube.com/watch?v=e7zMbX_0e5o ) and save as `public/sounds/catch.mp3`, or change the path.
+   * If the file is missing or blocked, a built-in synthesized chime is used.
+   */
+  CATCH_SFX_URL: "/sounds/catch.mp3",
 };

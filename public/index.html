@@ -24,6 +24,15 @@
       <div id="panelMain" class="tab-panel" role="tabpanel" aria-labelledby="tabMain">
         <div class="toolbar">
           <button type="button" class="btn primary" id="addCounter">+ Add counter</button>
+          <label class="toolbar-layout">
+            <span class="toolbar-layout-label" id="boardLayoutLabel">View</span>
+            <select id="boardLayoutSelect" class="toolbar-select" aria-labelledby="boardLayoutLabel">
+              <option value="default">1 column — comfortable</option>
+              <option value="compact">1 column — compact</option>
+              <option value="grid2">2 columns</option>
+              <option value="grid3">3 columns</option>
+            </select>
+          </label>
         </div>
         <main id="board" class="board"></main>
       </div>
@@ -32,6 +41,9 @@
         <nav class="graph-nav" role="tablist" aria-label="Graph sections">
           <button type="button" class="graph-nav-btn active" role="tab" data-graph-panel="dashboard" aria-selected="true" id="graphNavDashboard">
             Dashboard
+          </button>
+          <button type="button" class="graph-nav-btn" role="tab" data-graph-panel="captures" aria-selected="false" id="graphNavCaptures">
+            Captures
           </button>
           <button type="button" class="graph-nav-btn" role="tab" data-graph-panel="compare" aria-selected="false" id="graphNavCompare">
             Compare charts
@@ -65,7 +77,7 @@
             </label>
           </div>
           <p class="graph-filters-hint" id="graphFiltersHint">
-            Filters apply to dashboard numbers, cumulative line, compare-chart hunt lists, and the history tables.
+            Filters apply to dashboard numbers, captures list, cumulative line, compare-chart hunt lists, and the history tables.
           </p>
         </div>
 
@@ -89,10 +101,21 @@
             <div id="chartDashboardCumulative" class="chart-container" aria-label="Overall cumulative encounters (filtered)"></div>
             <h3 class="dash-chart-title">Encounter rate by session</h3>
             <p class="graph-hint graph-hint--tight">
-              Interval-based enc/h (outlier-clipped). Each line is one hunt; archived hunts use dashed strokes. The lighter line is the
+              Interval-based enc/h (drops points &gt; mean + 5σ, iteratively). Each line is one hunt; archived hunts use dashed strokes. The lighter line is the
               bucketed mean across sessions. Hover the dots for hunt name, rate, and time.
             </p>
             <div id="chartDashboardRate" class="chart-container chart-container--tall" aria-label="Encounter rate by hunt"></div>
+          </section>
+        </div>
+
+        <div id="graphPanelCaptures" class="graph-subpanel graph-subpanel--hidden" role="tabpanel" aria-labelledby="graphNavCaptures">
+          <section class="graph-section">
+            <h2 class="graph-section-title">Captures</h2>
+            <p class="graph-hint">
+              Completed shinies from <strong>Catch</strong> on a counter. Edit metadata here, or <strong>Restore</strong> to move a hunt back to
+              active counters (same as <strong>Undo</strong> on the catch notification). Graph filters above narrow this list.
+            </p>
+            <div id="capturesDashboardMount"></div>
           </section>
         </div>
 
@@ -100,7 +123,7 @@
           <section class="graph-section">
             <h2 class="graph-section-title">Compare charts</h2>
             <p class="graph-hint">
-              Choose a hunt that passes the filters. Rate uses encounters per hour with outlier clipping. Images show that hunt’s game
+              Choose a hunt that passes the filters. Rate drops outlier intervals (&gt; mean + 5σ, iterative). Images show that hunt’s game
               box art (if configured) and the first target’s shiny sprite.
             </p>
             <div class="compare-grid">
@@ -165,6 +188,7 @@
         </div>
       </div>
     </div>
+    <div id="catchToastRegion" class="catch-toast-region" aria-live="polite" aria-atomic="true"></div>
     <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
     <script src="game-data.js"></script>
     <script src="app.js"></script>

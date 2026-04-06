@@ -7,9 +7,14 @@
   const chartDashboardCumulative = document.getElementById("chartDashboardCumulative");
   const chartDashboardRate = document.getElementById("chartDashboardRate");
   const trackerHistoryMount = document.getElementById("trackerHistoryMount");
+  const capturesDashboardMount = document.getElementById("capturesDashboardMount");
 
   const MAX_EVENTS_PER_COUNTER = 12000;
   const EPH_WINDOW_MS = 60 * 60 * 1000;
+  const BOARD_LAYOUT_IDS = ["default", "compact", "grid2", "grid3"];
+  /** Drop interval-rate points this many sample standard deviations above the current mean (recomputed iteratively). */
+  const RATE_OUTLIER_STD_MULTIPLE = 5;
+  const RATE_OUTLIER_MAX_ITERS = 6;
 
   const UI = window.__ENCOUNTER_UI || {
     POKEMON_GAME_GROUPS: [],
@@ -17,11 +22,13 @@
     ODDS_PRESETS: [{ id: "full-auto", label: "Full odds (auto)" }],
     GAME_POKEDEX_MAP: {},
     GAME_BOX_ART: {},
+    CATCH_SFX_URL: "",
   };
 
   const graphPanelDashboard = document.getElementById("graphPanelDashboard");
   const graphPanelCompare = document.getElementById("graphPanelCompare");
   const graphPanelHistory = document.getElementById("graphPanelHistory");
+  const graphPanelCaptures = document.getElementById("graphPanelCaptures");
   const graphFilterGame = document.getElementById("graphFilterGame");
   const graphFilterOdds = document.getElementById("graphFilterOdds");
   const graphFilterMethod = document.getElementById("graphFilterMethod");
@@ -29,6 +36,62 @@
 
   const pokedexSpeciesCache = new Map();
   const speciesNationalIdCache = new Map();
+
+  /** Dex national id → `blob:` URL (fetched once per session). */
+  const shinySpriteBlobUrlByDex = new Map();
+  /** In-flight fetches so concurrent callers share one network request. */
+  const shinySpriteFetchByDex = new Map();
+  /** Dex ids that failed fetch or decode — avoid repeat requests. */
+  const shinySpriteFailedDex = new Set();
+
+  function invalidateShinySpriteCache(dexId) {
+    if (dexId == null) return;
+    const u = shinySpriteBlobUrlByDex.get(dexId);
+    if (u) {
+      if (typeof u === "string" && u.startsWith("blob:")) {
+        try {
+          URL.revokeObjectURL(u);
+        } catch (_) {}
+      }
+      shinySpriteBlobUrlByDex.delete(dexId);
+    }
+    shinySpriteFailedDex.delete(dexId);
+  }
+
+  /**
+   * Loads shiny sprite once per dex id; returns cached `blob:` URL (stable across re-renders, no image reload).
+   * If `fetch` fails (e.g. CORS), caches the raw GitHub URL once so img still works via browser cache.
+   */
+  async function getCachedShinySpriteUrl(dexId) {
+    if (!dexId || dexId < 1) return null;
+    if (shinySpriteFailedDex.has(dexId)) return null;
+    const cached = shinySpriteBlobUrlByDex.get(dexId);
+    if (cached) return cached;
+    let inflight = shinySpriteFetchByDex.get(dexId);
+    if (!inflight) {
+      const src = shinySpriteUrlByDexId(dexId);
+      inflight = (async () => {
+        try {
+          const r = await fetch(src, { mode: "cors" });
+          if (!r.ok) {
+            shinySpriteFailedDex.add(dexId);
+            return null;
+          }
+          const blob = await r.blob();
+          const objUrl = URL.createObjectURL(blob);
+          shinySpriteBlobUrlByDex.set(dexId, objUrl);
+          return objUrl;
+        } catch {
+          shinySpriteBlobUrlByDex.set(dexId, src);
+          return src;
+        } finally {
+          shinySpriteFetchByDex.delete(dexId);
+        }
+      })();
+      shinySpriteFetchByDex.set(dexId, inflight);
+    }
+    return inflight;
+  }
 
   function getBoxArtUrl(game) {
     const m = UI.GAME_BOX_ART;
@@ -108,6 +171,53 @@
     const names = targets.map(formatSpeciesDisplayName);
     if (names.length <= 2) return names.join(", ");
     return `${names.slice(0, 2).join(", ")} +${names.length - 2}`;
+  }
+
+  /**
+   * Shiny battle sprite in a flex-grow zone under +/−/Set, filling down to the Catch row (with row-main spacing).
+   * First target only (tooltip if multiple).
+   */
+  function appendCounterTargetSprite(stackEl, c) {
+    const slugs = Array.isArray(c.targets) ? c.targets.filter((s) => typeof s === "string" && s) : [];
+    if (!slugs.length) return;
+    const slug = slugs[0];
+    stackEl.classList.add("controls-sprite-stack--with-sprite");
+    const zone = document.createElement("div");
+    zone.className = "counter-target-sprite-zone";
+    const spriteWrap = document.createElement("div");
+    spriteWrap.className = "counter-target-sprite-wrap";
+    if (slugs.length > 1) {
+      const others = slugs.slice(1).map(formatSpeciesDisplayName).join(", ");
+      spriteWrap.title = `Also hunting: ${others}`;
+    }
+    const img = document.createElement("img");
+    img.className = "counter-target-sprite";
+    img.alt = `Shiny ${formatSpeciesDisplayName(slug)}`;
+    img.loading = "lazy";
+    img.decoding = "async";
+    spriteWrap.appendChild(img);
+    zone.appendChild(spriteWrap);
+    stackEl.appendChild(zone);
+    void (async () => {
+      const dex = await ensureSpeciesNationalId(slug);
+      if (!dex) {
+        zone.remove();
+        stackEl.classList.remove("controls-sprite-stack--with-sprite");
+        return;
+      }
+      const spriteUrl = await getCachedShinySpriteUrl(dex);
+      if (!spriteUrl) {
+        zone.remove();
+        stackEl.classList.remove("controls-sprite-stack--with-sprite");
+        return;
+      }
+      img.onerror = () => {
+        invalidateShinySpriteCache(dex);
+        zone.remove();
+        stackEl.classList.remove("controls-sprite-stack--with-sprite");
+      };
+      img.src = spriteUrl;
+    })();
   }
 
   function populateGameSelect(sel, currentValue) {
@@ -262,6 +372,7 @@
     counters: [],
     trackerHistory: [],
     pastCounters: [],
+    boardLayout: "default",
     graphUi: {
       subPanel: "dashboard",
       filters: {
@@ -333,6 +444,8 @@
     }
     for (const p of state.pastCounters) {
       if (!Array.isArray(p.events)) p.events = [];
+      if (!Array.isArray(p.customButtons)) p.customButtons = [];
+      if (!p.completedAt) p.completedAt = new Date().toISOString();
       p.game = p.game ?? "";
       p.huntingMethod = p.huntingMethod ?? "";
       p.includeOdds = p.includeOdds ?? false;
@@ -341,7 +454,7 @@
       p.targets = Array.isArray(p.targets) ? p.targets.filter((x) => typeof x === "string") : [];
     }
     if (!state.graphUi || typeof state.graphUi !== "object") state.graphUi = {};
-    state.graphUi.subPanel = ["dashboard", "compare", "history"].includes(state.graphUi.subPanel)
+    state.graphUi.subPanel = ["dashboard", "captures", "compare", "history"].includes(state.graphUi.subPanel)
       ? state.graphUi.subPanel
       : "dashboard";
     if (!state.graphUi.filters || typeof state.graphUi.filters !== "object") state.graphUi.filters = {};
@@ -358,6 +471,21 @@
       h.includeOdds = h.includeOdds ?? false;
       h.oddsPresetId = h.oddsPresetId ?? "full-auto";
     }
+    state.boardLayout = BOARD_LAYOUT_IDS.includes(state.boardLayout) ? state.boardLayout : "default";
+  }
+
+  function applyBoardLayout() {
+    const layout = BOARD_LAYOUT_IDS.includes(state.boardLayout) ? state.boardLayout : "default";
+    state.boardLayout = layout;
+    board.className = "board";
+    if (layout !== "default") board.classList.add(`board--${layout}`);
+    const appEl = document.querySelector(".app");
+    if (appEl) {
+      appEl.classList.toggle("app--board-wide2", layout === "grid2");
+      appEl.classList.toggle("app--board-wide3", layout === "grid3");
+    }
+    const sel = document.getElementById("boardLayoutSelect");
+    if (sel) sel.value = layout;
   }
 
   function trimEvents(c) {
@@ -432,7 +560,7 @@
   }
 
   /** Short “pokeball clamp” style SFX (original synthesis — not a recording). */
-  function playCatchSound() {
+  function playCatchSoundSynth() {
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return;
@@ -480,6 +608,118 @@
       o3.start(t0 + 0.14);
       o3.stop(t0 + 0.28);
     } catch (_) {}
+  }
+
+  /** Prefer `CATCH_SFX_URL` (e.g. MP3 in public/sounds/); fall back to synthesized chime. */
+  function playCatchSound() {
+    const url = typeof UI.CATCH_SFX_URL === "string" ? UI.CATCH_SFX_URL.trim() : "";
+    if (!url) {
+      playCatchSoundSynth();
+      return;
+    }
+    try {
+      const a = new Audio(url);
+      a.volume = 0.88;
+      const p = a.play();
+      if (p !== undefined && typeof p.then === "function") p.catch(() => playCatchSoundSynth());
+    } catch {
+      playCatchSoundSynth();
+    }
+  }
+
+  let catchToastAutoDismissTimer = null;
+
+  function dismissCatchToast() {
+    const region = document.getElementById("catchToastRegion");
+    if (region) region.innerHTML = "";
+    if (catchToastAutoDismissTimer) {
+      clearTimeout(catchToastAutoDismissTimer);
+      catchToastAutoDismissTimer = null;
+    }
+  }
+
+  function showCatchToast(pastCounterId, huntName, encounterTotal) {
+    dismissCatchToast();
+    const region = document.getElementById("catchToastRegion");
+    if (!region) return;
+    const toast = document.createElement("div");
+    toast.className = "catch-toast";
+    toast.setAttribute("role", "status");
+
+    const title = document.createElement("div");
+    title.className = "catch-toast-title";
+    title.textContent = "Shiny caught!";
+
+    const sub = document.createElement("div");
+    sub.className = "catch-toast-sub";
+    const enc =
+      encounterTotal != null && Number.isFinite(Number(encounterTotal))
+        ? String(encounterTotal)
+        : "—";
+    sub.textContent = `${huntName || "(unnamed)"} · ${enc} encounters`;
+
+    const actions = document.createElement("div");
+    actions.className = "catch-toast-actions";
+
+    const undoBtn = document.createElement("button");
+    undoBtn.type = "button";
+    undoBtn.className = "btn catch-toast-undo";
+    undoBtn.textContent = "Undo";
+    undoBtn.title = "Restore this hunt to active counters";
+    undoBtn.addEventListener("click", () => {
+      if (undoCatchRestoreActive(pastCounterId)) {
+        dismissCatchToast();
+        showStatus("Catch undone — hunt restored to Counters");
+      }
+    });
+
+    const dismissBtn = document.createElement("button");
+    dismissBtn.type = "button";
+    dismissBtn.className = "btn small catch-toast-dismiss";
+    dismissBtn.textContent = "Dismiss";
+    dismissBtn.addEventListener("click", () => dismissCatchToast());
+
+    actions.appendChild(undoBtn);
+    actions.appendChild(dismissBtn);
+    toast.appendChild(title);
+    toast.appendChild(sub);
+    toast.appendChild(actions);
+    region.appendChild(toast);
+
+    catchToastAutoDismissTimer = setTimeout(() => dismissCatchToast(), 14000);
+  }
+
+  function undoCatchRestoreActive(pastId) {
+    const idx = state.pastCounters.findIndex((p) => p.id === pastId);
+    if (idx === -1) return false;
+    if (state.counters.some((c) => c.id === pastId)) return false;
+    const p = state.pastCounters[idx];
+    const events = JSON.parse(JSON.stringify(p.events || []));
+    const doneAt = p.completedAt;
+    const cleaned = events.filter((e) => !(e && e.kind === "catch" && e.t === doneAt));
+    const counter = {
+      id: p.id,
+      name: p.name || "",
+      value: Math.max(0, Math.trunc(Number(p.value)) || 0),
+      createdAt: p.createdAt || new Date().toISOString(),
+      lastUptickAt: p.lastUptickAt ?? null,
+      events: cleaned,
+      customButtons: Array.isArray(p.customButtons) ? JSON.parse(JSON.stringify(p.customButtons)) : [],
+      game: p.game || "",
+      huntingMethod: p.huntingMethod || "",
+      includeOdds: !!p.includeOdds,
+      oddsPresetId: p.oddsPresetId || "full-auto",
+      notes: p.notes || "",
+      huntPanelExpanded: false,
+      incrementsPanelExpanded: false,
+      targets: Array.isArray(p.targets) ? [...p.targets] : [],
+    };
+    state.pastCounters.splice(idx, 1);
+    state.counters.push(counter);
+    render();
+    renderGraphsIfVisible();
+    scheduleSave();
+    return true;
   }
 
   function fireConfetti() {
@@ -607,6 +847,7 @@
       oddsPresetId: c.oddsPresetId || "full-auto",
       notes: c.notes || "",
       targets: Array.isArray(c.targets) ? [...c.targets] : [],
+      customButtons: JSON.parse(JSON.stringify(c.customButtons || [])),
     };
 
     setTimeout(() => {
@@ -614,6 +855,7 @@
       state.counters = state.counters.filter((x) => x.id !== id);
       render();
       scheduleSave();
+      showCatchToast(snap.id, snap.name || "(unnamed)", snap.value);
     }, 900);
   }
 
@@ -803,20 +1045,34 @@
       if (!Number.isFinite(ratePerHour) || ratePerHour < 0) continue;
       raw.push({ t: (t0 + t1) / 2, y: ratePerHour });
     }
-    return filterSuperOutliers(raw);
+    return filterRateOutliers(raw);
   }
 
-  function filterSuperOutliers(points) {
-    if (points.length < 4) return points;
-    const ys = points.map((p) => p.y).sort((a, b) => a - b);
-    const med = ys[Math.floor(ys.length / 2)];
-    const q95 = ys[Math.min(Math.floor(ys.length * 0.95), ys.length - 1)];
-    const cap = Math.max(med * 12, q95 * 3, 900);
-    return points.map((p) => ({
-      t: p.t,
-      y: Math.min(p.y, cap),
-      clipped: p.y > cap,
-    }));
+  /**
+   * Remove implausible rate spikes (e.g. bad imports: huge delta or overlapping timestamps).
+   * Iteratively: drop points with y > mean + k·σ, recompute mean/σ on survivors until stable.
+   */
+  function filterRateOutliers(points) {
+    if (points.length < 3) return points;
+    let kept = points.slice();
+    for (let iter = 0; iter < RATE_OUTLIER_MAX_ITERS; iter++) {
+      const ys = kept.map((p) => p.y);
+      const n = ys.length;
+      const mean = ys.reduce((a, b) => a + b, 0) / n;
+      let variance = 0;
+      if (n > 1) {
+        for (let i = 0; i < n; i++) variance += (ys[i] - mean) ** 2;
+        variance /= n - 1;
+      }
+      const std = Math.sqrt(Math.max(0, variance));
+      if (!Number.isFinite(std) || std < 1e-9) break;
+      const ceiling = mean + RATE_OUTLIER_STD_MULTIPLE * std;
+      const next = kept.filter((p) => p.y <= ceiling);
+      if (next.length === kept.length) break;
+      if (next.length < 2) return points;
+      kept = next;
+    }
+    return kept;
   }
 
   function downsample(points, maxN) {
@@ -1333,17 +1589,20 @@
         for (const slug of c.targets || []) {
           const dexId = await ensureSpeciesNationalId(slug);
           if (!dexId) continue;
+          const spriteUrl = await getCachedShinySpriteUrl(dexId);
+          if (!spriteUrl) continue;
           const fig = document.createElement("figure");
           fig.className = "dash-shiny-figure";
           const img = document.createElement("img");
           img.className = "dash-shiny-sprite";
-          img.src = shinySpriteUrlByDexId(dexId);
+          img.src = spriteUrl;
           img.alt = `Shiny ${formatSpeciesDisplayName(slug)}`;
           img.width = 96;
           img.height = 96;
           img.loading = "lazy";
           img.decoding = "async";
           img.onerror = () => {
+            invalidateShinySpriteCache(dexId);
             fig.hidden = true;
           };
           const cap = document.createElement("figcaption");
@@ -1399,7 +1658,7 @@
       <div class="dash-stat"><span class="dash-stat-label">Completed shinies</span><span class="dash-stat-value">${shinies}</span></div>
       <div class="dash-stat"><span class="dash-stat-label">Avg enc / shiny</span><span class="dash-stat-value">${avg != null ? avg.toFixed(1) : "—"}</span></div>
       <div class="dash-stat" title="Sum of encounters in the last 60 minutes across all filtered hunts (same window as each counter’s rate)."><span class="dash-stat-label">Enc last 60 min (Σ)</span><span class="dash-stat-value">${Math.round(ephSum)}</span></div>
-      <div class="dash-stat" title="Median interval-based enc/h after merging all filtered hunts’ encounter events in time order (outlier-clipped, like Compare charts)."><span class="dash-stat-label">Median pace (merged)</span><span class="dash-stat-value">${formatDashboardRate(medRate)}</span></div>
+      <div class="dash-stat" title="Median interval-based enc/h after merging all filtered hunts’ encounter events in time order (same outlier rule as charts: drop rates &gt; mean + 5σ, iteratively)."><span class="dash-stat-label">Median pace (merged)</span><span class="dash-stat-value">${formatDashboardRate(medRate)}</span></div>
     `;
     dashStats.appendChild(row1);
 
@@ -1521,12 +1780,19 @@
     }
     const dexId = await ensureSpeciesNationalId(slug);
     if (dexId) {
-      shiny.onerror = () => {
+      const spriteUrl = await getCachedShinySpriteUrl(dexId);
+      if (spriteUrl) {
+        shiny.onerror = () => {
+          invalidateShinySpriteCache(dexId);
+          shiny.hidden = true;
+        };
+        shiny.src = spriteUrl;
+        shiny.hidden = false;
+        shiny.alt = `Shiny ${formatSpeciesDisplayName(slug)}`;
+      } else {
         shiny.hidden = true;
-      };
-      shiny.src = shinySpriteUrlByDexId(dexId);
-      shiny.hidden = false;
-      shiny.alt = `Shiny ${formatSpeciesDisplayName(slug)}`;
+        shiny.removeAttribute("src");
+      }
     } else {
       shiny.hidden = true;
       shiny.removeAttribute("src");
@@ -1690,6 +1956,224 @@
     return d.innerHTML;
   }
 
+  function isoToDatetimeLocalValue(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function openPastCaptureEditDialog(pastId) {
+    const p = pastCounterById(pastId);
+    if (!p) return;
+    let dlg = document.getElementById("pastCaptureEditDialog");
+    if (!dlg) {
+      dlg = document.createElement("dialog");
+      dlg.id = "pastCaptureEditDialog";
+      dlg.className = "past-capture-dialog";
+      document.body.appendChild(dlg);
+    }
+    dlg.innerHTML = "";
+
+    const head = document.createElement("h3");
+    head.className = "past-capture-dialog-title";
+    head.textContent = "Edit capture";
+
+    const form = document.createElement("form");
+    form.className = "past-capture-form";
+
+    function field(labelText, control) {
+      const w = document.createElement("div");
+      w.className = "past-capture-field";
+      const lab = document.createElement("label");
+      lab.className = "field-label";
+      lab.textContent = labelText;
+      w.appendChild(lab);
+      w.appendChild(control);
+      return w;
+    }
+
+    const nameIn = document.createElement("input");
+    nameIn.type = "text";
+    nameIn.className = "counter-name";
+    nameIn.value = p.name || "";
+    nameIn.autocomplete = "off";
+
+    const gameSel = document.createElement("select");
+    gameSel.className = "hunt-select";
+    populateGameSelect(gameSel, p.game);
+
+    const methodSel = document.createElement("select");
+    methodSel.className = "hunt-select";
+    for (const m of UI.HUNTING_METHODS) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      if ((p.huntingMethod || "(not set)") === m) o.selected = true;
+      methodSel.appendChild(o);
+    }
+
+    const valIn = document.createElement("input");
+    valIn.type = "number";
+    valIn.className = "value-input";
+    valIn.min = "0";
+    valIn.step = "1";
+    valIn.value = String(Math.max(0, Math.trunc(Number(p.value)) || 0));
+
+    const notesTa = document.createElement("textarea");
+    notesTa.className = "hunt-notes";
+    notesTa.rows = 3;
+    notesTa.value = p.notes || "";
+
+    const completedIn = document.createElement("input");
+    completedIn.type = "datetime-local";
+    completedIn.className = "counter-name";
+    completedIn.value = isoToDatetimeLocalValue(p.completedAt);
+
+    const oddsCb = document.createElement("input");
+    oddsCb.type = "checkbox";
+    oddsCb.id = "past-cap-odds";
+    oddsCb.checked = !!p.includeOdds;
+
+    const oddsCbLab = document.createElement("label");
+    oddsCbLab.className = "odds-cb-label";
+    oddsCbLab.htmlFor = "past-cap-odds";
+    oddsCbLab.textContent = "Include odds (for charts / history)";
+
+    const oddsCbRow = document.createElement("div");
+    oddsCbRow.className = "odds-cb-row";
+    oddsCbRow.appendChild(oddsCb);
+    oddsCbRow.appendChild(oddsCbLab);
+
+    const oddsSel = document.createElement("select");
+    oddsSel.className = "hunt-select";
+    oddsSel.disabled = !p.includeOdds;
+    for (const op of UI.ODDS_PRESETS) {
+      const o = document.createElement("option");
+      o.value = op.id;
+      o.textContent = op.label;
+      if ((p.oddsPresetId || "full-auto") === op.id) o.selected = true;
+      oddsSel.appendChild(o);
+    }
+    oddsCb.addEventListener("change", () => {
+      oddsSel.disabled = !oddsCb.checked;
+    });
+
+    form.appendChild(field("Counter name", nameIn));
+    form.appendChild(field("Pokémon game", gameSel));
+    form.appendChild(field("Hunting method", methodSel));
+    form.appendChild(field("Encounters at catch", valIn));
+    form.appendChild(field("Caught at (local time)", completedIn));
+    form.appendChild(field("Notes", notesTa));
+    form.appendChild(oddsCbRow);
+    form.appendChild(field("Odds preset", oddsSel));
+
+    const hint = document.createElement("p");
+    hint.className = "field-hint past-capture-edit-hint";
+    hint.textContent =
+      "Targets are unchanged here — restore the hunt to edit species. Changing encounters does not rewrite event history.";
+
+    const actions = document.createElement("div");
+    actions.className = "past-capture-dialog-actions";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => dlg.close());
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "submit";
+    saveBtn.className = "btn primary";
+    saveBtn.textContent = "Save";
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+
+    form.appendChild(hint);
+    form.appendChild(actions);
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const cur = pastCounterById(pastId);
+      if (!cur) {
+        dlg.close();
+        return;
+      }
+      cur.name = nameIn.value.trim();
+      cur.game = gameSel.value;
+      cur.huntingMethod = methodSel.value;
+      const n = Math.trunc(Number(valIn.value));
+      if (Number.isFinite(n) && n >= 0) cur.value = n;
+      cur.notes = notesTa.value;
+      const dt = new Date(completedIn.value);
+      if (!Number.isNaN(dt.getTime())) cur.completedAt = dt.toISOString();
+      cur.includeOdds = oddsCb.checked;
+      cur.oddsPresetId = oddsSel.value || "full-auto";
+      dlg.close();
+      scheduleSave();
+      renderGraphsIfVisible();
+    });
+
+    dlg.appendChild(head);
+    dlg.appendChild(form);
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else dlg.setAttribute("open", "");
+  }
+
+  function renderCapturesDashboard() {
+    if (!capturesDashboardMount) return;
+    capturesDashboardMount.innerHTML = "";
+    const sorted = [...state.pastCounters].sort(
+      (a, b) => new Date(b.completedAt || 0) - new Date(a.completedAt || 0),
+    );
+    const rows = sorted.filter((p) => matchesGraphFilters(p));
+
+    const t = document.createElement("table");
+    t.className = "history-table captures-table";
+    t.innerHTML =
+      "<thead><tr><th>Name</th><th>Game</th><th>Method</th><th>Targets</th><th>Encounters</th><th>Caught</th><th>Actions</th></tr></thead><tbody></tbody>";
+    const tb = t.querySelector("tbody");
+
+    if (rows.length === 0) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        sorted.length === 0
+          ? '<td colspan="7" class="history-empty">No captures yet — use Catch on a counter.</td>'
+          : '<td colspan="7" class="history-empty">No captures match the current filters</td>';
+      tb.appendChild(tr);
+    } else {
+      for (const p of rows) {
+        const tr = document.createElement("tr");
+        const done = p.completedAt ? new Date(p.completedAt).toLocaleString() : "—";
+        const g = p.game && p.game !== "(not set)" ? escapeHtml(p.game) : "—";
+        const m = p.huntingMethod && p.huntingMethod !== "(not set)" ? escapeHtml(p.huntingMethod) : "—";
+        const tg = escapeHtml(formatTargetsCell(p.targets));
+        tr.innerHTML = `<td>${escapeHtml(p.name || "")}</td><td>${g}</td><td>${m}</td><td>${tg}</td><td>${Math.trunc(Number(p.value)) || 0}</td><td>${escapeHtml(done)}</td>`;
+        const tdAct = document.createElement("td");
+        tdAct.className = "captures-actions";
+        const editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.className = "btn small";
+        editBtn.textContent = "Edit";
+        editBtn.addEventListener("click", () => openPastCaptureEditDialog(p.id));
+        const restoreBtn = document.createElement("button");
+        restoreBtn.type = "button";
+        restoreBtn.className = "btn small";
+        restoreBtn.textContent = "Restore";
+        restoreBtn.title = "Move this hunt back to active counters (same as Undo on the catch toast)";
+        restoreBtn.addEventListener("click", () => {
+          if (undoCatchRestoreActive(p.id)) {
+            dismissCatchToast();
+            showStatus("Hunt restored to Counters");
+          }
+        });
+        tdAct.appendChild(editBtn);
+        tdAct.appendChild(restoreBtn);
+        tr.appendChild(tdAct);
+        tb.appendChild(tr);
+      }
+    }
+    capturesDashboardMount.appendChild(t);
+  }
+
   function populateGraphFilterDropdowns() {
     if (!graphFilterGame || !state.graphUi) return;
     const f = state.graphUi.filters;
@@ -1784,12 +2268,16 @@
     if (graphPanelHistory) {
       graphPanelHistory.classList.toggle("graph-subpanel--hidden", sub !== "history");
     }
+    if (graphPanelCaptures) {
+      graphPanelCaptures.classList.toggle("graph-subpanel--hidden", sub !== "captures");
+    }
   }
 
   function renderGraphs() {
     populateGraphFilterDropdowns();
     syncGraphSubPanel();
     renderDashboard();
+    renderCapturesDashboard();
     renderCompareCharts();
     renderTrackerHistoryTable();
   }
@@ -1865,6 +2353,7 @@
   }
 
   function render() {
+    applyBoardLayout();
     board.innerHTML = "";
 
     if (state.counters.length === 0) {
@@ -2182,6 +2671,9 @@
       display.className = "display";
       display.textContent = String(c.value);
 
+      displayCol.appendChild(encLabel);
+      displayCol.appendChild(display);
+
       const uptick = document.createElement("div");
       uptick.className = "last-uptick";
       uptick.dataset.uptickFor = c.id;
@@ -2194,8 +2686,6 @@
       ephLine.dataset.ephFor = c.id;
       ephLine.textContent = `Encounters/h (last 60 min): ${formatEph(computeEph(c))}`;
 
-      displayCol.appendChild(encLabel);
-      displayCol.appendChild(display);
       displayCol.appendChild(uptick);
       displayCol.appendChild(ephLine);
 
@@ -2246,8 +2736,13 @@
       controls.appendChild(plusBtn);
       controls.appendChild(inputWrap);
 
+      const controlsSpriteStack = document.createElement("div");
+      controlsSpriteStack.className = "controls-sprite-stack";
+      controlsSpriteStack.appendChild(controls);
+      appendCounterTargetSprite(controlsSpriteStack, c);
+
       rowMain.appendChild(displayCol);
-      rowMain.appendChild(controls);
+      rowMain.appendChild(controlsSpriteStack);
 
       const catchRow = document.createElement("div");
       catchRow.className = "catch-row";
@@ -2375,9 +2870,24 @@
     }
   }, 5000);
 
+  let boardLayoutBound = false;
+  function setupBoardLayoutSelect() {
+    if (boardLayoutBound) return;
+    const sel = document.getElementById("boardLayoutSelect");
+    if (!sel) return;
+    boardLayoutBound = true;
+    sel.addEventListener("change", () => {
+      state.boardLayout = sel.value;
+      scheduleSave();
+      applyBoardLayout();
+    });
+  }
+
   setupTabs();
   setupGraphNav();
   setupGraphFilters();
+  setupBoardLayoutSelect();
+  applyBoardLayout();
   load().catch((e) => {
     console.error(e);
     board.innerHTML =

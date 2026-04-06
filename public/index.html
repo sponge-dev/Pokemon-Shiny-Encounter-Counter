@@ -101,8 +101,9 @@
             <div id="chartDashboardCumulative" class="chart-container" aria-label="Overall cumulative encounters (filtered)"></div>
             <h3 class="dash-chart-title">Encounter rate by session</h3>
             <p class="graph-hint graph-hint--tight">
-              Interval-based enc/h (drops points &gt; mean + 5σ, iteratively). Each line is one hunt; archived hunts use dashed strokes. The lighter line is the
-              bucketed mean across sessions. Hover the dots for hunt name, rate, and time.
+              Each point is net encounter change in a fixed wall-clock window (20 minutes by default), scaled to enc/h — not the gap between individual clicks.
+              Segments outside mean ± 5σ are dropped iteratively. Each line is one hunt; past hunts are dashed. The lighter line is a mean across sessions.
+              Hover the dots for hunt name, rate, and time.
             </p>
             <div id="chartDashboardRate" class="chart-container chart-container--tall" aria-label="Encounter rate by hunt"></div>
           </section>

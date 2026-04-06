@@ -10,8 +10,38 @@
   const capturesDashboardMount = document.getElementById("capturesDashboardMount");
 
   const MAX_EVENTS_PER_COUNTER = 12000;
-  const EPH_WINDOW_MS = 60 * 60 * 1000;
+  /** Rolling window for “recent pace” on counters and dashboard Σ (was 1 hr). */
+  const EPH_WINDOW_MS = 2 * 60 * 60 * 1000;
+  /** Rate charts: net encounter deltas summed per this wall-clock span → enc/h (avoids per-click spikes). */
+  const RATE_CHART_BUCKET_MS = 20 * 60 * 1000;
   const BOARD_LAYOUT_IDS = ["default", "compact", "grid2", "grid3"];
+
+  function formatPaceWindowShort() {
+    const m = Math.round(EPH_WINDOW_MS / 60000);
+    if (m >= 60 && m % 60 === 0) {
+      const h = m / 60;
+      return h === 1 ? "1 hr" : `${h} hr`;
+    }
+    return `${m} min`;
+  }
+
+  function formatPaceWindowPhrase() {
+    const m = Math.round(EPH_WINDOW_MS / 60000);
+    if (m >= 60 && m % 60 === 0) {
+      const h = m / 60;
+      return h === 1 ? "last hour" : `last ${h} hours`;
+    }
+    return `last ${m} minutes`;
+  }
+
+  function formatRateBucketPhrase() {
+    const m = Math.round(RATE_CHART_BUCKET_MS / 60000);
+    if (m >= 60 && m % 60 === 0) {
+      const h = m / 60;
+      return h === 1 ? "1-hour" : `${h}-hour`;
+    }
+    return `${m}-minute`;
+  }
   /** Drop interval-rate points this many sample standard deviations above the current mean (recomputed iteratively). */
   const RATE_OUTLIER_STD_MULTIPLE = 5;
   const RATE_OUTLIER_MAX_ITERS = 6;
@@ -415,7 +445,40 @@
       : id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   }
 
+  function trimEvents(c) {
+    if (!c.events || c.events.length <= MAX_EVENTS_PER_COUNTER) return;
+    c.events.splice(0, c.events.length - MAX_EVENTS_PER_COUNTER);
+  }
+
+  /** Net change from +1 / −1 / custom steps — drives rate charts and EPH. */
+  function pushEncounterDelta(c, delta, t) {
+    const d = Math.trunc(delta);
+    if (d === 0) return;
+    if (!c.events) c.events = [];
+    c.events.push({ t: t || new Date().toISOString(), kind: "encounter", delta: d });
+    trimEvents(c);
+  }
+
+  /** Bulk or “Set:” adjustments — counts toward value but ignored for rate / recent-pace charts. */
+  function pushBaselineDelta(c, delta, t) {
+    const d = Math.trunc(delta);
+    if (d === 0) return;
+    if (!c.events) c.events = [];
+    c.events.push({ t: t || new Date().toISOString(), kind: "baseline", delta: d });
+    trimEvents(c);
+  }
+
+  function sumLedgerDeltas(events) {
+    let s = 0;
+    for (const e of events || []) {
+      if (e.kind !== "encounter" && e.kind !== "baseline") continue;
+      s += e.delta != null ? Math.trunc(e.delta) : e.kind === "encounter" ? 1 : 0;
+    }
+    return s;
+  }
+
   function normalizeState() {
+    let touched = false;
     if (!Array.isArray(state.counters)) state.counters = [];
     if (!Array.isArray(state.trackerHistory)) state.trackerHistory = [];
     if (!Array.isArray(state.pastCounters)) state.pastCounters = [];
@@ -434,12 +497,35 @@
       c.targets = Array.isArray(c.targets) ? c.targets.filter((x) => typeof x === "string") : [];
       if (!c.createdAt) c.createdAt = c.lastUptickAt || new Date().toISOString();
       if (!Array.isArray(c.events)) c.events = [];
+      if (c.events.length === 1) {
+        const e0 = c.events[0];
+        if (e0 && e0.kind === "encounter") {
+          const d0 = e0.delta != null ? Math.trunc(e0.delta) : 1;
+          const vEarly = Math.trunc(c.value ?? 0);
+          if (vEarly > 0 && d0 === vEarly) {
+            e0.kind = "baseline";
+            touched = true;
+          }
+        }
+      }
       if (c.events.length === 0 && c.value > 0) {
         c.events.push({
           t: c.lastUptickAt || c.createdAt,
-          kind: "encounter",
+          kind: "baseline",
           delta: Math.trunc(c.value),
         });
+        touched = true;
+      }
+      const v = Math.trunc(c.value ?? 0);
+      const sumE = sumLedgerDeltas(c.events);
+      if (sumE !== v) {
+        c.events.push({
+          t: c.lastUptickAt || new Date().toISOString(),
+          kind: "baseline",
+          delta: v - sumE,
+        });
+        trimEvents(c);
+        touched = true;
       }
     }
     for (const p of state.pastCounters) {
@@ -452,6 +538,30 @@
       p.oddsPresetId = p.oddsPresetId ?? "full-auto";
       p.notes = p.notes ?? "";
       p.targets = Array.isArray(p.targets) ? p.targets.filter((x) => typeof x === "string") : [];
+      if (p.events.length === 1) {
+        const e0 = p.events[0];
+        if (e0 && e0.kind === "encounter") {
+          const d0 = e0.delta != null ? Math.trunc(e0.delta) : 1;
+          const pvEarly = Math.trunc(p.value ?? 0);
+          if (pvEarly > 0 && d0 === pvEarly) {
+            e0.kind = "baseline";
+            touched = true;
+          }
+        }
+      }
+      const pv = Math.trunc(p.value ?? 0);
+      const sumP = sumLedgerDeltas(p.events);
+      if (sumP !== pv) {
+        p.events.push({
+          t: p.completedAt || p.lastUptickAt || new Date().toISOString(),
+          kind: "baseline",
+          delta: pv - sumP,
+        });
+        if (p.events.length > MAX_EVENTS_PER_COUNTER) {
+          p.events.splice(0, p.events.length - MAX_EVENTS_PER_COUNTER);
+        }
+        touched = true;
+      }
     }
     if (!state.graphUi || typeof state.graphUi !== "object") state.graphUi = {};
     state.graphUi.subPanel = ["dashboard", "captures", "compare", "history"].includes(state.graphUi.subPanel)
@@ -472,6 +582,7 @@
       h.oddsPresetId = h.oddsPresetId ?? "full-auto";
     }
     state.boardLayout = BOARD_LAYOUT_IDS.includes(state.boardLayout) ? state.boardLayout : "default";
+    return touched;
   }
 
   function applyBoardLayout() {
@@ -486,19 +597,6 @@
     }
     const sel = document.getElementById("boardLayoutSelect");
     if (sel) sel.value = layout;
-  }
-
-  function trimEvents(c) {
-    if (!c.events || c.events.length <= MAX_EVENTS_PER_COUNTER) return;
-    c.events.splice(0, c.events.length - MAX_EVENTS_PER_COUNTER);
-  }
-
-  function pushEncounterEvents(c, delta, t) {
-    const d = Math.trunc(delta);
-    if (d <= 0) return;
-    if (!c.events) c.events = [];
-    c.events.push({ t: t || new Date().toISOString(), kind: "encounter", delta: d });
-    trimEvents(c);
   }
 
   function counterById(id) {
@@ -547,16 +645,18 @@
     for (const e of enc) {
       const t = new Date(e.t).getTime();
       if (Number.isNaN(t) || now - t > EPH_WINDOW_MS || now - t < 0) continue;
-      sum += e.delta != null ? e.delta : 1;
+      sum += e.delta != null ? Math.trunc(e.delta) : 1;
     }
     return sum;
   }
 
   function formatEph(eph) {
-    if (!Number.isFinite(eph) || eph < 0) return "—";
+    if (!Number.isFinite(eph)) return "—";
     if (eph === 0) return "0 /hr";
-    if (eph < 10) return eph.toFixed(1) + " /hr";
-    return Math.round(eph) + " /hr";
+    const neg = eph < 0;
+    const a = Math.abs(eph);
+    const s = a < 10 ? a.toFixed(1) + " /hr" : Math.round(a) + " /hr";
+    return neg ? "−" + s : s;
   }
 
   /** Short “pokeball clamp” style SFX (original synthesis — not a recording). */
@@ -756,7 +856,7 @@
     const res = await fetch("/api/state");
     if (!res.ok) throw new Error("Load failed");
     state = await res.json();
-    normalizeState();
+    if (normalizeState()) scheduleSave();
     render();
   }
 
@@ -867,8 +967,11 @@
     const next = Number.isFinite(n) ? Math.trunc(n) : 0;
     c.value = next;
     const now = new Date().toISOString();
+    const net = next - prev;
+    if (net !== 0) {
+      pushBaselineDelta(c, net, now);
+    }
     if (next > prev) {
-      pushEncounterEvents(c, next - prev, now);
       c.lastUptickAt = now;
     }
     render();
@@ -883,8 +986,11 @@
     const prev = Math.trunc(c.value);
     c.value = Math.trunc(c.value + n);
     const now = new Date().toISOString();
+    const net = c.value - prev;
+    if (net !== 0) {
+      pushEncounterDelta(c, net, now);
+    }
     if (c.value > prev) {
-      pushEncounterEvents(c, c.value - prev, now);
       c.lastUptickAt = now;
     }
     render();
@@ -986,7 +1092,7 @@
 
   function buildCumulativeSeries(events) {
     const enc = (events || [])
-      .filter((e) => e.kind === "encounter")
+      .filter((e) => e.kind === "encounter" || e.kind === "baseline")
       .slice()
       .sort((a, b) => new Date(a.t) - new Date(b.t));
     let cum = 0;
@@ -994,7 +1100,7 @@
     for (const e of enc) {
       const dt = new Date(e.t).getTime();
       if (Number.isNaN(dt)) continue;
-      cum += e.delta != null ? e.delta : 1;
+      cum += e.delta != null ? Math.trunc(e.delta) : e.kind === "encounter" ? 1 : 0;
       pts.push({ t: dt, y: cum });
     }
     return pts;
@@ -1005,15 +1111,21 @@
     for (const c of state.counters) {
       if (!matchesGraphFilters(c)) continue;
       for (const e of c.events || []) {
-        if (e.kind !== "encounter") continue;
-        flat.push({ t: e.t, delta: e.delta != null ? e.delta : 1 });
+        if (e.kind !== "encounter" && e.kind !== "baseline") continue;
+        flat.push({
+          t: e.t,
+          delta: e.delta != null ? Math.trunc(e.delta) : e.kind === "encounter" ? 1 : 0,
+        });
       }
     }
     for (const p of state.pastCounters) {
       if (!matchesGraphFilters(p)) continue;
       for (const e of p.events || []) {
-        if (e.kind !== "encounter") continue;
-        flat.push({ t: e.t, delta: e.delta != null ? e.delta : 1 });
+        if (e.kind !== "encounter" && e.kind !== "baseline") continue;
+        flat.push({
+          t: e.t,
+          delta: e.delta != null ? Math.trunc(e.delta) : e.kind === "encounter" ? 1 : 0,
+        });
       }
     }
     flat.sort((a, b) => new Date(a.t) - new Date(b.t));
@@ -1033,24 +1145,38 @@
       .filter((e) => e.kind === "encounter")
       .slice()
       .sort((a, b) => new Date(a.t) - new Date(b.t));
+    if (enc.length < 2) return [];
+
+    const tms = enc
+      .map((e) => {
+        const t = new Date(e.t).getTime();
+        const d = e.delta != null ? Math.trunc(e.delta) : 1;
+        return { t, d };
+      })
+      .filter((x) => !Number.isNaN(x.t));
+    if (tms.length < 2) return [];
+
+    const bucketMs = Math.max(60_000, RATE_CHART_BUCKET_MS);
+    const minT = tms[0].t;
+    const map = new Map();
+    for (const { t, d } of tms) {
+      const b = Math.floor((t - minT) / bucketMs);
+      map.set(b, (map.get(b) || 0) + d);
+    }
     const raw = [];
-    for (let i = 1; i < enc.length; i++) {
-      const t0 = new Date(enc[i - 1].t).getTime();
-      const t1 = new Date(enc[i].t).getTime();
-      if (Number.isNaN(t0) || Number.isNaN(t1)) continue;
-      const dt = (t1 - t0) / 1000;
-      if (dt <= 0) continue;
-      const d = enc[i].delta != null ? enc[i].delta : 1;
-      const ratePerHour = (d / dt) * 3600;
-      if (!Number.isFinite(ratePerHour) || ratePerHour < 0) continue;
-      raw.push({ t: (t0 + t1) / 2, y: ratePerHour });
+    for (const b of [...map.keys()].sort((x, y) => x - y)) {
+      const sum = map.get(b);
+      if (sum === 0) continue;
+      const tMid = minT + b * bucketMs + bucketMs / 2;
+      const ratePerHour = (sum / bucketMs) * 3600000;
+      if (Number.isFinite(ratePerHour)) raw.push({ t: tMid, y: ratePerHour });
     }
     return filterRateOutliers(raw);
   }
 
   /**
-   * Remove implausible rate spikes (e.g. bad imports: huge delta or overlapping timestamps).
-   * Iteratively: drop points with y > mean + k·σ, recompute mean/σ on survivors until stable.
+   * Remove implausible rate spikes (huge |net delta| / short Δt, bad imports, etc.).
+   * Two-sided: drop y outside mean ± k·σ, recompute until stable.
    */
   function filterRateOutliers(points) {
     if (points.length < 3) return points;
@@ -1066,8 +1192,10 @@
       }
       const std = Math.sqrt(Math.max(0, variance));
       if (!Number.isFinite(std) || std < 1e-9) break;
-      const ceiling = mean + RATE_OUTLIER_STD_MULTIPLE * std;
-      const next = kept.filter((p) => p.y <= ceiling);
+      const k = RATE_OUTLIER_STD_MULTIPLE;
+      const lo = mean - k * std;
+      const hi = mean + k * std;
+      const next = kept.filter((p) => p.y >= lo && p.y <= hi);
       if (next.length === kept.length) break;
       if (next.length < 2) return points;
       kept = next;
@@ -1082,6 +1210,36 @@
     for (let i = 0; i < points.length; i += step) out.push(points[i]);
     if (out[out.length - 1] !== points[points.length - 1]) out.push(points[points.length - 1]);
     return out;
+  }
+
+  /** Polyline `d` for SVG (linear segments). */
+  function pathDLineThroughPoints(pts, sx, sy) {
+    return pts
+      .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p.t).toFixed(2)} ${sy(p.y).toFixed(2)}`)
+      .join(" ");
+  }
+
+  /**
+   * Smooth curve through points (Catmull–Rom → cubic Béziers). Larger `div` = gentler (less overshoot).
+   * Passes through all vertices; good for dashboard rate lines. Use a higher div for near-monotone series.
+   */
+  function pathDCatmullCardinal(pts, sx, sy, div = 6) {
+    if (pts.length < 2) return "";
+    if (pts.length === 2) return pathDLineThroughPoints(pts, sx, sy);
+    const c = pts.map((p) => ({ x: sx(p.t), y: sy(p.y) }));
+    let d = `M ${c[0].x.toFixed(2)} ${c[0].y.toFixed(2)}`;
+    for (let i = 0; i < c.length - 1; i++) {
+      const p0 = c[Math.max(0, i - 1)];
+      const p1 = c[i];
+      const p2 = c[i + 1];
+      const p3 = c[Math.min(c.length - 1, i + 2)];
+      const cp1x = p1.x + (p2.x - p0.x) / div;
+      const cp1y = p1.y + (p2.y - p0.y) / div;
+      const cp2x = p2.x - (p3.x - p1.x) / div;
+      const cp2y = p2.y - (p3.y - p1.y) / div;
+      d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
+    }
+    return d;
   }
 
   function drawLineChart(container, points, opts) {
@@ -1123,9 +1281,10 @@
     svg.setAttribute("class", "chart-svg");
     svg.setAttribute("role", "img");
 
-    const path = pts
-      .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p.t).toFixed(2)} ${sy(p.y).toFixed(2)}`)
-      .join(" ");
+    const smooth = opts.smooth === "catmull" && pts.length >= 3;
+    const path = smooth
+      ? pathDCatmullCardinal(pts, sx, sy, opts.smoothTensionDiv ?? 6)
+      : pathDLineThroughPoints(pts, sx, sy);
     const pathEl = document.createElementNS("http://www.w3.org/2000/svg", "path");
     pathEl.setAttribute("d", path);
     pathEl.setAttribute("fill", "none");
@@ -1299,9 +1458,8 @@
 
     function addPath(pts, color, dashed, strokeWidth) {
       if (pts.length < 2) return;
-      const d = pts
-        .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p.t).toFixed(2)} ${sy(p.y).toFixed(2)}`)
-        .join(" ");
+      const d =
+        pts.length >= 3 ? pathDCatmullCardinal(pts, sx, sy, 6) : pathDLineThroughPoints(pts, sx, sy);
       const pathEl = document.createElementNS("http://www.w3.org/2000/svg", "path");
       pathEl.setAttribute("d", d);
       pathEl.setAttribute("fill", "none");
@@ -1499,7 +1657,7 @@
         if (Number.isNaN(t)) continue;
         minT = Math.min(minT, t);
         maxT = Math.max(maxT, t);
-        totalEnc += e.delta != null ? e.delta : 1;
+        totalEnc += e.delta != null ? Math.trunc(e.delta) : 1;
       }
     }
     if (!Number.isFinite(minT) || maxT <= minT) return null;
@@ -1546,8 +1704,10 @@
 
   function formatDashboardRate(y) {
     if (y == null || !Number.isFinite(y)) return "—";
-    if (y < 100) return y.toFixed(1) + " /hr";
-    return Math.round(y) + " /hr";
+    const neg = y < 0;
+    const a = Math.abs(y);
+    const s = a < 100 ? a.toFixed(1) + " /hr" : Math.round(a) + " /hr";
+    return neg ? "−" + s : s;
   }
 
   async function updateDashboardArt() {
@@ -1657,8 +1817,8 @@
       <div class="dash-stat"><span class="dash-stat-label">Hunts (filters)</span><span class="dash-stat-value">${hc.total}</span></div>
       <div class="dash-stat"><span class="dash-stat-label">Completed shinies</span><span class="dash-stat-value">${shinies}</span></div>
       <div class="dash-stat"><span class="dash-stat-label">Avg enc / shiny</span><span class="dash-stat-value">${avg != null ? avg.toFixed(1) : "—"}</span></div>
-      <div class="dash-stat" title="Sum of encounters in the last 60 minutes across all filtered hunts (same window as each counter’s rate)."><span class="dash-stat-label">Enc last 60 min (Σ)</span><span class="dash-stat-value">${Math.round(ephSum)}</span></div>
-      <div class="dash-stat" title="Median interval-based enc/h after merging all filtered hunts’ encounter events in time order (same outlier rule as charts: drop rates &gt; mean + 5σ, iteratively)."><span class="dash-stat-label">Median pace (merged)</span><span class="dash-stat-value">${formatDashboardRate(medRate)}</span></div>
+      <div class="dash-stat" title="Sum of net encounter deltas in the ${formatPaceWindowPhrase()} across all filtered hunts (same window as each counter’s recent pace)."><span class="dash-stat-label">Enc ${formatPaceWindowShort()} (Σ)</span><span class="dash-stat-value">${Math.round(ephSum)}</span></div>
+      <div class="dash-stat" title="Median enc/h from ${formatRateBucketPhrase()} windows after merging all filtered hunts’ events in time order (same outlier rule as charts: drop rates outside mean ± 5σ, iteratively)."><span class="dash-stat-label">Median pace (merged)</span><span class="dash-stat-value">${formatDashboardRate(medRate)}</span></div>
     `;
     dashStats.appendChild(row1);
 
@@ -1687,8 +1847,7 @@
       const tbl = document.createElement("table");
       tbl.className = "dash-table";
       const thead = document.createElement("thead");
-      thead.innerHTML =
-        "<tr><th>Game</th><th>Hunts</th><th>Active</th><th>Past</th><th>Encounters</th><th>Last 60m (Σ)</th></tr>";
+      thead.innerHTML = `<tr><th>Game</th><th>Hunts</th><th>Active</th><th>Past</th><th>Encounters</th><th>Enc ${formatPaceWindowShort()} (Σ)</th></tr>`;
       tbl.appendChild(thead);
       const tbody = document.createElement("tbody");
       const limit = 24;
@@ -1715,6 +1874,8 @@
       color: "#5eb0ff",
       yAxisLabel: "Encounters (filtered hunts)",
       yFormat: (y) => String(Math.round(y)),
+      smooth: "catmull",
+      smoothTensionDiv: 14,
     });
     drawMultiSeriesRateChart(chartDashboardRate, buildDashboardRateSeriesList());
     void updateDashboardArt();
@@ -2684,7 +2845,7 @@
       const ephLine = document.createElement("div");
       ephLine.className = "stat-meta";
       ephLine.dataset.ephFor = c.id;
-      ephLine.textContent = `Encounters/h (last 60 min): ${formatEph(computeEph(c))}`;
+      ephLine.textContent = `Encounters/h (${formatPaceWindowPhrase()}): ${formatEph(computeEph(c))}`;
 
       displayCol.appendChild(uptick);
       displayCol.appendChild(ephLine);
@@ -2854,7 +3015,7 @@
         el.title = t.title || "";
       }
       const ephEl = document.querySelector(`[data-eph-for="${esc}"]`);
-      if (ephEl) ephEl.textContent = `Encounters/h (last 60 min): ${formatEph(computeEph(c))}`;
+      if (ephEl) ephEl.textContent = `Encounters/h (${formatPaceWindowPhrase()}): ${formatEph(computeEph(c))}`;
       const shinyEl = document.querySelector(`[data-shiny-chance-for="${esc}"]`);
       if (shinyEl && c.includeOdds) shinyEl.textContent = formatShinyChanceText(c);
     }

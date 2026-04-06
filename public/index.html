@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Encounter counter</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <h1>Encounter counter</h1>
+        <p class="sub">Counts save to <code>encounters-cache.txt</code> in this folder.</p>
+        <nav class="tabs" role="tablist" aria-label="Main views">
+          <button type="button" class="tab active" role="tab" id="tabMain" aria-selected="true" aria-controls="panelMain" data-tab="main">
+            Counters
+          </button>
+          <button type="button" class="tab" role="tab" id="tabGraphs" aria-selected="false" aria-controls="panelGraphs" data-tab="graphs">
+            Graphs &amp; history
+          </button>
+        </nav>
+      </header>
+
+      <div id="panelMain" class="tab-panel" role="tabpanel" aria-labelledby="tabMain">
+        <div class="toolbar">
+          <button type="button" class="btn primary" id="addCounter">+ Add counter</button>
+        </div>
+        <main id="board" class="board"></main>
+      </div>
+
+      <div id="panelGraphs" class="tab-panel tab-panel--graphs" role="tabpanel" aria-labelledby="tabGraphs" hidden>
+        <nav class="graph-nav" role="tablist" aria-label="Graph sections">
+          <button type="button" class="graph-nav-btn active" role="tab" data-graph-panel="dashboard" aria-selected="true" id="graphNavDashboard">
+            Dashboard
+          </button>
+          <button type="button" class="graph-nav-btn" role="tab" data-graph-panel="compare" aria-selected="false" id="graphNavCompare">
+            Compare charts
+          </button>
+          <button type="button" class="graph-nav-btn" role="tab" data-graph-panel="history" aria-selected="false" id="graphNavHistory">
+            Tracker history
+          </button>
+        </nav>
+
+        <div class="graph-filters" id="graphFiltersBar">
+          <div class="graph-filters-row">
+            <label class="graph-filter-label">
+              Game
+              <select id="graphFilterGame" class="graph-select graph-filter-select" aria-label="Filter by game"></select>
+            </label>
+            <label class="graph-filter-label">
+              Odds preset
+              <select id="graphFilterOdds" class="graph-select graph-filter-select" aria-label="Filter by odds preset"></select>
+            </label>
+            <label class="graph-filter-label">
+              Method
+              <select id="graphFilterMethod" class="graph-select graph-filter-select" aria-label="Filter by hunting method"></select>
+            </label>
+            <label class="graph-filter-label">
+              Odds tracking
+              <select id="graphFilterOddsTracking" class="graph-select graph-filter-select" aria-label="Filter by whether odds are enabled">
+                <option value="all">Any</option>
+                <option value="with">With odds</option>
+                <option value="without">Without odds</option>
+              </select>
+            </label>
+          </div>
+          <p class="graph-filters-hint" id="graphFiltersHint">
+            Filters apply to dashboard numbers, cumulative line, compare-chart hunt lists, and the history tables.
+          </p>
+        </div>
+
+        <div id="graphPanelDashboard" class="graph-subpanel" role="tabpanel" aria-labelledby="graphNavDashboard">
+          <section class="graph-section dashboard-section">
+            <h2 class="graph-section-title">Dashboard</h2>
+            <p class="graph-hint">
+              Stats and charts use filtered hunts. Cumulative line merges encounters. Rate chart draws one line per session (active = solid,
+              past = dashed) plus a mean line when multiple sessions exist. Hover points for details. Shiny sprites list every target on
+              every active filtered hunt.
+            </p>
+            <div class="dash-media" id="dashHuntMedia" hidden>
+              <figure class="dash-art">
+                <img id="dashBoxArt" class="dash-box-art" alt="" width="120" height="160" loading="lazy" decoding="async" hidden />
+                <figcaption class="dash-art-caption">Game</figcaption>
+              </figure>
+              <div class="dash-shiny-strip" id="dashShinyStrip" aria-label="Active hunt target sprites" hidden></div>
+            </div>
+            <div id="dashStats" class="dash-stats"></div>
+            <h3 class="dash-chart-title">Cumulative encounters</h3>
+            <div id="chartDashboardCumulative" class="chart-container" aria-label="Overall cumulative encounters (filtered)"></div>
+            <h3 class="dash-chart-title">Encounter rate by session</h3>
+            <p class="graph-hint graph-hint--tight">
+              Interval-based enc/h (outlier-clipped). Each line is one hunt; archived hunts use dashed strokes. The lighter line is the
+              bucketed mean across sessions. Hover the dots for hunt name, rate, and time.
+            </p>
+            <div id="chartDashboardRate" class="chart-container chart-container--tall" aria-label="Encounter rate by hunt"></div>
+          </section>
+        </div>
+
+        <div id="graphPanelCompare" class="graph-subpanel graph-subpanel--hidden" role="tabpanel" aria-labelledby="graphNavCompare">
+          <section class="graph-section">
+            <h2 class="graph-section-title">Compare charts</h2>
+            <p class="graph-hint">
+              Choose a hunt that passes the filters. Rate uses encounters per hour with outlier clipping. Images show that hunt’s game
+              box art (if configured) and the first target’s shiny sprite.
+            </p>
+            <div class="compare-grid">
+              <div class="compare-cell">
+                <div class="compare-media">
+                  <img data-compare-box="1" class="compare-art-img" alt="" width="72" height="96" loading="lazy" decoding="async" hidden />
+                  <img data-compare-shiny="1" class="compare-art-img compare-art-img--shiny" alt="" width="64" height="64" loading="lazy" decoding="async" hidden />
+                </div>
+                <label class="graph-label">
+                  Chart 1
+                  <select id="graphPick1" class="graph-select"></select>
+                </label>
+                <label class="graph-check graph-check--inline">
+                  <input type="checkbox" class="graph-rate-cb" data-chart="1" />
+                  Rate
+                </label>
+                <div id="chartCompare1" class="chart-container chart-container--tall"></div>
+                <div id="chartCompare1Rate" class="chart-container chart-container--tall chart-container--hidden"></div>
+              </div>
+              <div class="compare-cell">
+                <div class="compare-media">
+                  <img data-compare-box="2" class="compare-art-img" alt="" width="72" height="96" loading="lazy" decoding="async" hidden />
+                  <img data-compare-shiny="2" class="compare-art-img compare-art-img--shiny" alt="" width="64" height="64" loading="lazy" decoding="async" hidden />
+                </div>
+                <label class="graph-label">
+                  Chart 2
+                  <select id="graphPick2" class="graph-select"></select>
+                </label>
+                <label class="graph-check graph-check--inline">
+                  <input type="checkbox" class="graph-rate-cb" data-chart="2" />
+                  Rate
+                </label>
+                <div id="chartCompare2" class="chart-container chart-container--tall"></div>
+                <div id="chartCompare2Rate" class="chart-container chart-container--tall chart-container--hidden"></div>
+              </div>
+              <div class="compare-cell">
+                <div class="compare-media">
+                  <img data-compare-box="3" class="compare-art-img" alt="" width="72" height="96" loading="lazy" decoding="async" hidden />
+                  <img data-compare-shiny="3" class="compare-art-img compare-art-img--shiny" alt="" width="64" height="64" loading="lazy" decoding="async" hidden />
+                </div>
+                <label class="graph-label">
+                  Chart 3
+                  <select id="graphPick3" class="graph-select"></select>
+                </label>
+                <label class="graph-check graph-check--inline">
+                  <input type="checkbox" class="graph-rate-cb" data-chart="3" />
+                  Rate
+                </label>
+                <div id="chartCompare3" class="chart-container chart-container--tall"></div>
+                <div id="chartCompare3Rate" class="chart-container chart-container--tall chart-container--hidden"></div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div id="graphPanelHistory" class="graph-subpanel graph-subpanel--hidden" role="tabpanel" aria-labelledby="graphNavHistory">
+          <section class="graph-section">
+            <h2 class="graph-section-title">Tracker history</h2>
+            <p class="graph-hint">Active hunts, completed catches (past), and removed trackers — rows respect the same filters.</p>
+            <div id="trackerHistoryMount"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+    <script src="game-data.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

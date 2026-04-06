@@ -1,0 +1,13 @@
+{
+  "name": "encounter-counter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple encounter counter with file-backed cache",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

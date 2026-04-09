@@ -14,6 +14,8 @@
   const EPH_WINDOW_MS = 2 * 60 * 60 * 1000;
   /** Rate charts: net encounter deltas summed per this wall-clock span → enc/h (avoids per-click spikes). */
   const RATE_CHART_BUCKET_MS = 20 * 60 * 1000;
+  /** Dashboard “full timeline” pace: each gap between encounter events counts at most this much (trim long AFK). */
+  const AFK_GAP_CAP_MS = 60 * 60 * 1000;
   const BOARD_LAYOUT_IDS = ["default", "compact", "grid2", "grid3"];
 
   function formatPaceWindowShort() {
@@ -1090,6 +1092,94 @@
     scheduleSave();
   }
 
+  /** Sorted encounter timestamps (ms) from one hunt's events. */
+  function encounterWallTimesMsFromEvents(events) {
+    const flat = [];
+    for (const e of events || []) {
+      if (e.kind !== "encounter") continue;
+      const t = new Date(e.t).getTime();
+      if (!Number.isNaN(t)) flat.push(t);
+    }
+    flat.sort((a, b) => a - b);
+    return flat;
+  }
+
+  /** All encounter times across graph-filtered hunts (dashboard alignment). */
+  function collectMergedFilteredEncounterWallTimesMs() {
+    const flat = [];
+    for (const c of state.counters) {
+      if (!matchesGraphFilters(c)) continue;
+      for (const e of c.events || []) {
+        if (e.kind !== "encounter") continue;
+        const t = new Date(e.t).getTime();
+        if (!Number.isNaN(t)) flat.push(t);
+      }
+    }
+    for (const p of state.pastCounters) {
+      if (!matchesGraphFilters(p)) continue;
+      for (const e of p.events || []) {
+        if (e.kind !== "encounter") continue;
+        const t = new Date(e.t).getTime();
+        if (!Number.isNaN(t)) flat.push(t);
+      }
+    }
+    flat.sort((a, b) => a - b);
+    return flat;
+  }
+
+  /**
+   * Map wall-clock ms → plot x so each gap between encounters contributes at most AFK_GAP_CAP_MS
+   * (same idea as dashboard active-time span). Linear within each inter-encounter segment.
+   */
+  function makeEncounterWallToPlotMapper(sortedWallMs) {
+    const T = sortedWallMs;
+    const n = T.length;
+    if (n === 0) return (w) => w;
+    if (n === 1) return () => 0;
+    const P = new Array(n);
+    P[0] = 0;
+    for (let i = 1; i < n; i++) {
+      const gap = T[i] - T[i - 1];
+      P[i] = P[i - 1] + Math.min(Math.max(0, gap), AFK_GAP_CAP_MS);
+    }
+    return function plotAt(wallMs) {
+      if (wallMs <= T[0]) return P[0] + (wallMs - T[0]);
+      if (wallMs >= T[n - 1]) return P[n - 1] + Math.min(wallMs - T[n - 1], AFK_GAP_CAP_MS);
+      let lo = 0;
+      let hi = n - 1;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi + 1) / 2);
+        if (T[mid] <= wallMs) lo = mid;
+        else hi = mid - 1;
+      }
+      const i = lo;
+      if (i >= n - 1) return P[n - 1];
+      const t0 = T[i];
+      const t1 = T[i + 1];
+      const g = t1 - t0;
+      if (g <= 0) return P[i];
+      const span = Math.min(g, AFK_GAP_CAP_MS);
+      return P[i] + ((wallMs - t0) / g) * span;
+    };
+  }
+
+  /** Sort by wall `t`, set `t` to capped-gap cumulative x and `wallT` for labels/tooltips. */
+  function applyAfkCompressedXToPoints(points) {
+    if (!points.length) return [];
+    const sorted = points.slice().sort((a, b) => a.t - b.t);
+    let plotAcc = 0;
+    let prevWall = sorted[0].t;
+    return sorted.map((p, i) => {
+      const wallT = p.t;
+      if (i > 0) {
+        const gap = wallT - prevWall;
+        plotAcc += Math.min(Math.max(0, gap), AFK_GAP_CAP_MS);
+        prevWall = wallT;
+      }
+      return { ...p, wallT, t: plotAcc };
+    });
+  }
+
   function buildCumulativeSeries(events) {
     const enc = (events || [])
       .filter((e) => e.kind === "encounter" || e.kind === "baseline")
@@ -1103,7 +1193,7 @@
       cum += e.delta != null ? Math.trunc(e.delta) : e.kind === "encounter" ? 1 : 0;
       pts.push({ t: dt, y: cum });
     }
-    return pts;
+    return applyAfkCompressedXToPoints(pts);
   }
 
   function buildGlobalCumulativeSeries() {
@@ -1137,10 +1227,10 @@
       cum += e.delta;
       pts.push({ t: dt, y: cum });
     }
-    return pts;
+    return applyAfkCompressedXToPoints(pts);
   }
 
-  function buildRateSeries(events) {
+  function buildRateSeries(events, wallToPlot) {
     const enc = (events || [])
       .filter((e) => e.kind === "encounter")
       .slice()
@@ -1169,7 +1259,10 @@
       if (sum === 0) continue;
       const tMid = minT + b * bucketMs + bucketMs / 2;
       const ratePerHour = (sum / bucketMs) * 3600000;
-      if (Number.isFinite(ratePerHour)) raw.push({ t: tMid, y: ratePerHour });
+      if (Number.isFinite(ratePerHour)) {
+        const plotT = typeof wallToPlot === "function" ? wallToPlot(tMid) : tMid;
+        raw.push({ t: plotT, y: ratePerHour, wallT: tMid });
+      }
     }
     return filterRateOutliers(raw);
   }
@@ -1294,8 +1387,10 @@
     pathEl.setAttribute("stroke-linecap", "round");
     svg.appendChild(pathEl);
 
-    const x0 = new Date(minX).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
-    const x1 = new Date(maxX).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+    const wallMin = opts.xWallRange?.min ?? Math.min(...pts.map((p) => (p.wallT != null ? p.wallT : p.t)));
+    const wallMax = opts.xWallRange?.max ?? Math.max(...pts.map((p) => (p.wallT != null ? p.wallT : p.t)));
+    const x0 = new Date(wallMin).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+    const x1 = new Date(wallMax).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
     const cap = document.createElementNS("http://www.w3.org/2000/svg", "text");
     cap.setAttribute("x", String(pad.l));
     cap.setAttribute("y", String(H - 8));
@@ -1362,11 +1457,14 @@
   }
 
   function buildDashboardRateSeriesList() {
+    const mergedEnc = collectMergedFilteredEncounterWallTimesMs();
+    const wallToPlot =
+      mergedEnc.length >= 2 ? makeEncounterWallToPlotMapper(mergedEnc) : null;
     const out = [];
     let idx = 0;
     for (const c of state.counters) {
       if (!matchesGraphFilters(c)) continue;
-      const pts = buildRateSeries(c.events);
+      const pts = buildRateSeries(c.events, wallToPlot);
       if (!pts.length) continue;
       out.push({
         id: c.id,
@@ -1379,7 +1477,7 @@
     }
     for (const p of state.pastCounters) {
       if (!matchesGraphFilters(p)) continue;
-      const pts = buildRateSeries(p.events);
+      const pts = buildRateSeries(p.events, wallToPlot);
       if (!pts.length) continue;
       out.push({
         id: p.id,
@@ -1411,12 +1509,17 @@
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
+    let wallMin = Infinity;
+    let wallMax = -Infinity;
     for (const s of series) {
       for (const pt of s.points) {
         minX = Math.min(minX, pt.t);
         maxX = Math.max(maxX, pt.t);
         minY = Math.min(minY, pt.y);
         maxY = Math.max(maxY, pt.y);
+        const w = pt.wallT != null ? pt.wallT : pt.t;
+        wallMin = Math.min(wallMin, w);
+        wallMax = Math.max(wallMax, w);
       }
     }
     for (const pt of avgPts) {
@@ -1495,7 +1598,8 @@
         circ.setAttribute("stroke", s.color);
         circ.setAttribute("stroke-width", "1");
         circ.setAttribute("class", "chart-rate-hit");
-        const when = new Date(pt.t).toLocaleString(undefined, {
+        const wallT = pt.wallT != null ? pt.wallT : pt.t;
+        const when = new Date(wallT).toLocaleString(undefined, {
           dateStyle: "short",
           timeStyle: "short",
         });
@@ -1520,20 +1624,26 @@
         circ.setAttribute("stroke", "#94a3b8");
         circ.setAttribute("stroke-width", "1");
         const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-        title.textContent = `Mean (bucketed across sessions) — ${formatDashboardRate(pt.y)} at ${new Date(pt.t).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })}`;
+        title.textContent = `Mean (bucketed across sessions) — ${formatDashboardRate(pt.y)}`;
         circ.appendChild(title);
         svg.appendChild(circ);
       }
     }
 
-    const x0 = new Date(minX).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
-    const x1 = new Date(maxX).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+    const capWall0 =
+      Number.isFinite(wallMin) && Number.isFinite(wallMax)
+        ? new Date(wallMin).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
+        : new Date(minX).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+    const capWall1 =
+      Number.isFinite(wallMin) && Number.isFinite(wallMax)
+        ? new Date(wallMax).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
+        : new Date(maxX).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
     const cap = document.createElementNS("http://www.w3.org/2000/svg", "text");
     cap.setAttribute("x", String(pad.l));
     cap.setAttribute("y", String(H - 10));
     cap.setAttribute("fill", "#8b9cb3");
     cap.setAttribute("font-size", "11");
-    cap.textContent = `${x0} → ${x1}`;
+    cap.textContent = `${capWall0} → ${capWall1}`;
     svg.appendChild(cap);
 
     const yl = document.createElementNS("http://www.w3.org/2000/svg", "text");
@@ -1647,21 +1757,31 @@
   }
 
   function getFilteredEncounterTimeSpan() {
-    let minT = Infinity;
-    let maxT = -Infinity;
-    let totalEnc = 0;
+    const rows = [];
     for (const h of getFilteredHunts()) {
       for (const e of h.events || []) {
         if (e.kind !== "encounter") continue;
         const t = new Date(e.t).getTime();
         if (Number.isNaN(t)) continue;
-        minT = Math.min(minT, t);
-        maxT = Math.max(maxT, t);
-        totalEnc += e.delta != null ? Math.trunc(e.delta) : 1;
+        const d = e.delta != null ? Math.trunc(e.delta) : 1;
+        rows.push({ t, d });
       }
     }
-    if (!Number.isFinite(minT) || maxT <= minT) return null;
-    return { minT, maxT, durationMs: maxT - minT, totalEnc };
+    if (rows.length === 0) return null;
+    rows.sort((a, b) => a.t - b.t);
+    const minT = rows[0].t;
+    const maxT = rows[rows.length - 1].t;
+    let totalEnc = 0;
+    for (const r of rows) totalEnc += r.d;
+
+    let activeMs = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const gap = rows[i].t - rows[i - 1].t;
+      if (gap <= 0) continue;
+      activeMs += Math.min(gap, AFK_GAP_CAP_MS);
+    }
+    const wallDurationMs = maxT - minT;
+    return { minT, maxT, durationMs: activeMs, wallDurationMs, totalEnc };
   }
 
   function overallAvgEncountersPerHourFiltered() {
@@ -1806,6 +1926,8 @@
     const span = getFilteredEncounterTimeSpan();
     const spanHrs =
       span && span.durationMs > 0 ? (span.durationMs / (60 * 60 * 1000)).toFixed(1) : null;
+    const wallHrs =
+      span && span.wallDurationMs > 0 ? (span.wallDurationMs / (60 * 60 * 1000)).toFixed(1) : null;
     const byGame = aggregateByGameFiltered();
 
     dashStats.innerHTML = "";
@@ -1833,8 +1955,8 @@
     const rowRate = document.createElement("div");
     rowRate.className = "dash-stats-row";
     rowRate.innerHTML = `
-      <div class="dash-stat" title="All encounter event deltas ÷ wall-clock time from first to last encounter (filtered)."><span class="dash-stat-label">Avg enc/h (full timeline)</span><span class="dash-stat-value">${formatDashboardRate(overallRate)}</span></div>
-      <div class="dash-stat"><span class="dash-stat-label">Encounter span</span><span class="dash-stat-value">${spanHrs != null ? `${spanHrs} hr` : "—"}</span></div>
+      <div class="dash-stat" title="Net encounter deltas ÷ active time: sum of gaps between encounter events, counting each gap at most 1 hour (longer AFK trimmed). Filtered hunts."><span class="dash-stat-label">Avg enc/h (active time)</span><span class="dash-stat-value">${formatDashboardRate(overallRate)}</span></div>
+      <div class="dash-stat" title="Active time used for the rate above (capped gaps). Wall clock first→last: ${wallHrs != null ? wallHrs + " hr" : "—"}."><span class="dash-stat-label">Active span (est.)</span><span class="dash-stat-value">${spanHrs != null ? `${spanHrs} hr` : "—"}</span></div>
     `;
     dashStats.appendChild(rowRate);
 
@@ -1983,7 +2105,9 @@
     });
     if (rateCb && rateCb.checked) {
       chartR.classList.remove("chart-container--hidden");
-      const rates = buildRateSeries(events);
+      const encWall = encounterWallTimesMsFromEvents(events);
+      const wallToPlot = encWall.length >= 2 ? makeEncounterWallToPlotMapper(encWall) : null;
+      const rates = buildRateSeries(events, wallToPlot);
       drawLineChart(chartR, rates, {
         color: "#4ade80",
         yAxisLabel: "Enc/h",
